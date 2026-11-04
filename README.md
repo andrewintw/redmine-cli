@@ -1,5 +1,7 @@
 # redmine-cli
 
+![AI-Assisted](https://img.shields.io/badge/Code-AI--Assisted-blueviolet)
+
 以指令列快速查詢 Redmine：列出指派給自己的 issue、檢視單一 issue 的內容／進度／留言、彙總專案未關閉數量，並統計個人已解決的 issue。支援 JSON/CSV 輸出與本地 assignee 快取。
 
 A command-line client for Redmine that lists your assigned issues, shows issue details, progress and comments, summarizes project backlogs, and tracks your resolved work. Includes JSON/CSV output and local assignee caching.
