@@ -114,7 +114,7 @@ usage: redmine_cli.py [<指令>] [選項]
   issues
   |-- --assignee <me|ID|帳號|姓名>    看別人的 issue
   |-- --status <open|closed|all|名稱>  狀態
-  |-- --project <ID|名稱>              只看某專案
+  |-- --project <ID|名稱,...>          只看某專案（可多個）
   `-- 其他選項見 issues --help
 
   projects
@@ -269,6 +269,7 @@ python3 redmine_cli.py issues --status "New,In Progress"
 python3 redmine_cli.py issues --tracker Bug --status "New,In Progress"
 python3 redmine_cli.py issues --tracker "Feature"
 python3 redmine_cli.py issues --project "Project A"
+python3 redmine_cli.py issues --project "Project A,Project B,Project C"
 python3 redmine_cli.py issues --limit 20
 python3 redmine_cli.py issues --sort id:asc
 python3 redmine_cli.py issues --format json
@@ -388,7 +389,8 @@ Project B         3
   `--resolved-status "Status Name"` 改成其他 Status。
 - 要同時計入 Closed，可加 `--resolved-status "Resolved,Closed"`。
 - 這個模式需要逐筆讀取 journals，issue 越多越慢。
-- 可加 `--project "Project A"` 只統計單一專案。
+- 可加 `--project "Project A"` 只統計單一專案，或
+  `--project "Project A,Project B"` 同時統計多個專案。
 - 支援 `--format json`、`--format csv`、`--output`。
 
 ## 列出 assignee
@@ -426,11 +428,12 @@ python3 redmine_cli.py export --dry-run
 python3 redmine_cli.py export --format both
 python3 redmine_cli.py export --format json
 python3 redmine_cli.py export --project my-project
+python3 redmine_cli.py export --project "Project A,Project B,Project C"
 python3 redmine_cli.py export --output-dir /tmp/redmine-export
 ```
 
 `--project` 可用專案名稱、identifier 或數字 ID，例如 `"Project A"`、
-`project-a` 或 `101`。
+`project-a` 或 `101`。多個專案以逗號分隔。
 
 預設輸出到 `output/`：
 
@@ -443,7 +446,7 @@ python3 redmine_cli.py export --output-dir /tmp/redmine-export
 | 參數 | 說明 |
 | --- | --- |
 | `--url` | Redmine 網址，預設讀取 `REDMINE_URL` |
-| `--project` | 只匯出指定專案名稱、identifier 或 id |
+| `--project` | 只匯出指定專案名稱、identifier 或 id；多個以逗號分隔 |
 | `--output-dir` | 輸出目錄，預設為程式所在目錄的 `output` |
 | `--format` | `json`、`csv`、`both`（預設） |
 | `--api-key-file` | 從檔案讀取 API 金鑰 |

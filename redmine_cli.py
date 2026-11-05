@@ -587,6 +587,13 @@ def resolve_project(raw, projects):
     return project.get("identifier") or str(project["id"])
 
 
+def resolve_projects(raw, projects):
+    tokens = [token.strip() for token in str(raw or "").split(",") if token.strip()]
+    if not tokens:
+        return []
+    return list(dict.fromkeys(resolve_project(token, projects) for token in tokens))
+
+
 def iterate_project_nodes(nodes):
     for project in nodes:
         yield project
@@ -825,6 +832,14 @@ def fetch_project_people(client, project, page_size=100):
     return people
 
 
+def fetch_projects_people(client, projects, page_size=100):
+    merged = {}
+    for project in projects:
+        for person in fetch_project_people(client, project, page_size):
+            merged[str(person["id"])] = person
+    return list(merged.values())
+
+
 def load_export_issues(output_dir):
     path = Path(output_dir) / "issues.json"
     if not path.exists():
@@ -1034,7 +1049,7 @@ def lookup_user_id_by_login(client, login):
     return None
 
 
-def resolve_assignee(raw, client, output_dir, project=None):
+def resolve_assignee(raw, client, output_dir, projects=None):
     value = (raw or "me").strip()
     if value.lower() == "me" or value.isdigit():
         return value
@@ -1060,8 +1075,8 @@ def resolve_assignee(raw, client, output_dir, project=None):
     if matched:
         return matched
 
-    if project:
-        project_people = fetch_project_people(client, project)
+    if projects:
+        project_people = fetch_projects_people(client, projects)
         matched = match_assignee(project_people, value)
         if matched:
             return matched
@@ -1314,35 +1329,36 @@ def command_issues(args, client, output_dir, page_size):
     tracker_values = (
         resolve_ids(trackers, args.tracker, "Tracker") if args.tracker else [None]
     )
-    project = None
-    if args.project:
-        project = resolve_project(args.project, get_projects(client))
-    assignee = resolve_assignee(args.assignee, client, output_dir, project)
+    project_values = (
+        resolve_projects(args.project, get_projects(client)) if args.project else [None]
+    )
+    assignee = resolve_assignee(args.assignee, client, output_dir, project_values)
 
     limit = max(0, args.limit)
     merged = {}
     for status_value in status_values:
         for tracker_value in tracker_values:
-            params = {
-                "status_id": status_value,
-                "assigned_to_id": assignee,
-                "sort": args.sort,
-            }
-            if tracker_value:
-                params["tracker_id"] = tracker_value
-            if project:
-                params["project_id"] = project
-            issues = fetch_all(
-                client,
-                "/issues.json",
-                "issues",
-                params=params,
-                page_size=page_size,
-                progress=True,
-                max_results=limit,
-            )
-            for issue in issues:
-                merged[issue.get("id")] = issue
+            for project_value in project_values:
+                params = {
+                    "status_id": status_value,
+                    "assigned_to_id": assignee,
+                    "sort": args.sort,
+                }
+                if tracker_value:
+                    params["tracker_id"] = tracker_value
+                if project_value:
+                    params["project_id"] = project_value
+                issues = fetch_all(
+                    client,
+                    "/issues.json",
+                    "issues",
+                    params=params,
+                    page_size=page_size,
+                    progress=True,
+                    max_results=limit,
+                )
+                for issue in issues:
+                    merged[issue.get("id")] = issue
 
     issues = list(merged.values())
     sort_issues(issues, args.sort)
@@ -1589,11 +1605,11 @@ def issue_resolved_by(issue, user_id, resolved_ids):
 def command_stats_by_resolution(
     args, client, output_dir, page_size, resolved_ids
 ):
-    project_filter = None
-    if args.project:
-        project_filter = resolve_project(args.project, get_projects(client))
+    project_filters = (
+        resolve_projects(args.project, get_projects(client)) if args.project else [None]
+    )
     assignee = resolve_assignee(
-        args.assignee, client, output_dir, project_filter
+        args.assignee, client, output_dir, project_filters
     )
     if assignee == "me":
         user_id = get_current_user(client).get("id")
@@ -1602,21 +1618,25 @@ def command_stats_by_resolution(
     if user_id is None:
         raise SystemExit("錯誤: 無法取得使用者 ID")
 
-    params = {
-        "updated_by": assignee,
-        "status_id": "*",
-        "sort": "id:asc",
-    }
-    if project_filter:
-        params["project_id"] = project_filter
-    issues = fetch_all(
-        client,
-        "/issues.json",
-        "issues",
-        params=params,
-        page_size=page_size,
-        progress=True,
-    )
+    merged = {}
+    for project_filter in project_filters:
+        params = {
+            "updated_by": assignee,
+            "status_id": "*",
+            "sort": "id:asc",
+        }
+        if project_filter:
+            params["project_id"] = project_filter
+        for issue in fetch_all(
+            client,
+            "/issues.json",
+            "issues",
+            params=params,
+            page_size=page_size,
+            progress=True,
+        ):
+            merged[issue.get("id")] = issue
+    issues = list(merged.values())
     print(
         f"檢查 {len(issues)} 筆 issue 的 journals（可能需要一些時間）...",
         file=sys.stderr,
@@ -1697,27 +1717,31 @@ def command_stats(args, client, output_dir, page_size):
     closed_ids = {
         str(status.get("id")) for status in statuses if status.get("is_closed")
     }
-    project_filter = None
-    if args.project:
-        project_filter = resolve_project(args.project, get_projects(client))
+    project_filters = (
+        resolve_projects(args.project, get_projects(client)) if args.project else [None]
+    )
     assignee = resolve_assignee(
-        args.assignee, client, output_dir, project_filter
+        args.assignee, client, output_dir, project_filters
     )
-    params = {
-        "assigned_to_id": assignee,
-        "status_id": "*",
-        "sort": "id:asc",
-    }
-    if project_filter:
-        params["project_id"] = project_filter
-    issues = fetch_all(
-        client,
-        "/issues.json",
-        "issues",
-        params=params,
-        page_size=page_size,
-        progress=True,
-    )
+    merged = {}
+    for project_filter in project_filters:
+        params = {
+            "assigned_to_id": assignee,
+            "status_id": "*",
+            "sort": "id:asc",
+        }
+        if project_filter:
+            params["project_id"] = project_filter
+        for issue in fetch_all(
+            client,
+            "/issues.json",
+            "issues",
+            params=params,
+            page_size=page_size,
+            progress=True,
+        ):
+            merged[issue.get("id")] = issue
+    issues = list(merged.values())
 
     buckets = {}
     for issue in issues:
@@ -1953,15 +1977,23 @@ def command_meta(args, client):
 
 
 def command_export(args, client, script_dir):
-    project = None
-    if args.project:
-        project = resolve_project(args.project, get_projects(client))
+    project_filters = (
+        resolve_projects(args.project, get_projects(client)) if args.project else [None]
+    )
     if args.dry_run:
-        dry_run(client, project, args.project)
+        if len(project_filters) == 1:
+            dry_run(client, project_filters[0], args.project)
+        else:
+            for project_filter in project_filters:
+                dry_run(client, project_filter, project_filter)
         return
 
     page_size = max(1, min(args.page_size, 100))
-    issues = fetch_issues(client, project, page_size)
+    merged = {}
+    for project_filter in project_filters:
+        for issue in fetch_issues(client, project_filter, page_size):
+            merged[issue.get("id")] = issue
+    issues = list(merged.values())
     output_dir = (
         Path(args.output_dir).expanduser()
         if args.output_dir
@@ -2026,7 +2058,7 @@ def build_parser():
             "  issues\n"
             "  |-- --assignee <me|ID|帳號|姓名>    看別人的 issue\n"
             "  |-- --status <open|closed|all|名稱>  狀態\n"
-            "  |-- --project <ID|名稱>              只看某專案\n"
+            "  |-- --project <ID|名稱,...>          只看某專案（可多個）\n"
             "  `-- 其他選項見 issues --help\n"
             "\n"
             "  projects\n"
@@ -2084,7 +2116,7 @@ def build_parser():
         "export",
         prog=f"{parser.prog} export",
         usage=(
-            "%(prog)s [--dry-run] [--project <名稱|ID>]\n"
+            "%(prog)s [--dry-run] [--project <名稱|ID>[,...]]\n"
             "       [--format json|csv|both] [--output-dir DIR]"
         ),
         help="匯出全部 issue 為 JSON/CSV",
@@ -2094,6 +2126,7 @@ def build_parser():
             "  %(prog)s --dry-run\n"
             "  %(prog)s --format both\n"
             "  %(prog)s --project my-project\n"
+            "  %(prog)s --project \"Project A,Project B\"\n"
             "  %(prog)s --output-dir /tmp/redmine-export"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2101,7 +2134,7 @@ def build_parser():
     export_group = export_parser.add_argument_group("匯出選項")
     export_group.add_argument(
         "--project",
-        help="預設全部專案；只匯出某專案才加（名稱/identifier/ID）",
+        help="預設全部專案；可逗號分隔多個（名稱/identifier/ID）",
     )
     export_group.add_argument(
         "--output-dir",
@@ -2197,7 +2230,7 @@ def build_parser():
         prog=f"{parser.prog} issues",
         usage=(
             "%(prog)s [--assignee <me|ID|ACCOUNT|NAME>]\n"
-            "       [--status <open|closed|all|NAME>] [--project <NAME|ID>]\n"
+            "       [--status <open|closed|all|NAME>] [--project <NAME|ID>[,...]]\n"
             "       [--format table|json|csv]"
         ),
         help="列出指派給指定人員的 issue",
@@ -2213,6 +2246,7 @@ def build_parser():
             "  %(prog)s --status all\n"
             "  %(prog)s --tracker Bug --status \"New,In Progress\"\n"
             "  %(prog)s --project \"Project A\"\n"
+            "  %(prog)s --project \"Project A,Project B,Project C\"\n"
             "  %(prog)s --format csv --output my_issues.csv"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2234,7 +2268,7 @@ def build_parser():
     )
     issue_query.add_argument(
         "--project",
-        help="預設全部專案；只看某專案才加",
+        help="預設全部專案；可逗號分隔多個專案",
     )
     issue_order = issues_parser.add_argument_group("排序與筆數")
     issue_order.add_argument(
@@ -2319,7 +2353,7 @@ def build_parser():
         prog=f"{parser.prog} stats",
         usage=(
             "%(prog)s [--assignee <me|ID|ACCOUNT|NAME>] [--by-resolution]\n"
-            "       [--project <NAME|ID>] [--resolved-status <NAME|ID>]\n"
+            "       [--project <NAME|ID>[,...]] [--resolved-status <NAME|ID>]\n"
             "       [--format table|json|csv]"
         ),
         help="統計指定人員目前在各專案的 issue 狀態",
@@ -2335,6 +2369,7 @@ def build_parser():
             "  %(prog)s --assignee me --by-resolution\n"
             "  %(prog)s --assignee 123\n"
             "  %(prog)s --assignee me --project \"Project A\"\n"
+            "  %(prog)s --assignee me --project \"Project A,Project B\"\n"
             "  %(prog)s --assignee me --resolved-status \"Resolved,Closed\""
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2347,7 +2382,7 @@ def build_parser():
     )
     stats_query.add_argument(
         "--project",
-        help="預設全部專案；只看某專案才加",
+        help="預設全部專案；可逗號分隔多個專案",
     )
     stats_query.add_argument(
         "--by-resolution",
