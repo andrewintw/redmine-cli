@@ -2,7 +2,7 @@
 
 ![AI-Assisted](https://img.shields.io/badge/Code-AI--Assisted-blueviolet)
 
-以指令列快速查詢 Redmine：列出指派給自己的 issue、檢視單一 issue 的內容／進度／留言、彙總專案未關閉數量，並統計個人已解決的 issue。支援 JSON/CSV 輸出與本地 assignee 快取。
+以指令列快速查詢 Redmine：列出指派給自己的 issue、檢視一或多個 issue 的內容／進度／留言、彙總專案未關閉數量，並統計個人已解決的 issue。支援 JSON/CSV 輸出與本地 assignee 快取。
 
 A command-line client for Redmine that lists your assigned issues, shows issue details, progress and comments, summarizes project backlogs, and tracks your resolved work. Includes JSON/CSV output and local assignee caching.
 
@@ -10,7 +10,7 @@ A command-line client for Redmine that lists your assigned issues, shows issue d
 
 - `projects`：列出所有專案，預設以階層表格標示未關閉 issue 數量
 - `issues`：列出指派給 `me` 或指定人員的 issue
-- `issue`：顯示單一 issue 的內容、進度、指派者與留言
+- `issue`：顯示一或多個 issue 的內容、進度、指派者與留言
 - `stats`：統計目前指派給指定人員的 issue，在各專案的 Open / Resolved / Closed 數量
 - `assignees`：列出曾出現在 issue 上的 assignee
 - `meta`：列出 Tracker、Status 與目前使用者
@@ -123,7 +123,8 @@ usage: redmine_cli.py [<指令>] [選項]
   |-- --hide-empty                     隱藏數量為 0
   `-- 其他選項見 projects --help
 
-  issue <ID>                           單一 issue 內容、進度、留言
+  issue <ID> [<ID> ...]                一或多個 issue 內容、進度、留言
+  |-- --include <LIST>                 預設 journals；可加 attachments,relations
   |-- --no-comments
   |-- --format <text|json>
   `-- 其他選項見 issue --help
@@ -150,6 +151,7 @@ usage: redmine_cli.py [<指令>] [選項]
 python3 redmine_cli.py                                   我的未關閉 issue
 python3 redmine_cli.py issues --assignee "USER_NAME"      看別人的 issue
 python3 redmine_cli.py issue 12345                       單一 issue 內容、進度、留言
+python3 redmine_cli.py issue 12345 67890 --format json   多筆 issue JSON
 python3 redmine_cli.py projects --summary                上層專案摘要
 python3 redmine_cli.py stats --by-resolution             我曾經解決的數量
 python3 redmine_cli.py assignees --live                  重建 assignee 名單
@@ -273,10 +275,15 @@ python3 redmine_cli.py issues --format csv --output my_issues.csv
 `--tracker` 可用 Tracker 名稱/ID，多個值以逗號分隔。
 名稱會自動轉成 Redmine API 需要的 ID，打到不存在的名稱會顯示可用選項。
 
-## 查看單一 issue
+`--format json` 的每筆記錄包含 `id`、`project`、`project_id`、`tracker`、
+`tracker_id`、`status`、`status_id`、`priority`、`subject`、`author`、
+`assigned_to`、`done_ratio`、`created_on`、`updated_on` 與 `url`。
+
+## 查看 issue（單筆或多筆）
 
 ```bash
 python3 redmine_cli.py issue 12345
+python3 redmine_cli.py issue 12345 67890
 ```
 
 輸出內容包含欄位、進度、指派者與留言：
@@ -309,6 +316,33 @@ python3 redmine_cli.py issue 12345 --no-comments
 python3 redmine_cli.py issue 12345 --format json
 python3 redmine_cli.py issue 12345 --format json --output issue.json
 ```
+
+一次查詢多筆時，JSON 輸出為陣列；單筆仍維持物件。重複的 ID 會自動去重；
+若部分 ID 不存在，錯誤會印到 stderr，其他成功項目仍會輸出，程式最後以非 0
+結束碼結束。
+
+```bash
+python3 redmine_cli.py issue 12345 67890 --format json
+```
+
+`--include` 可指定要一併取得的關聯資料，逗號分隔，預設 `journals`：
+
+```bash
+python3 redmine_cli.py issue 12345 --include journals,attachments,relations
+```
+
+可用值：`journals`、`attachments`、`relations`、`children`、`changesets`、
+`watchers`、`allowed_statuses`。`--no-comments` 會從 include 移除 `journals`，
+即使同時指定 `--include journals` 也一樣。
+
+當 include 指定 `attachments` 或 `relations` 時，text 模式會多出對應區塊，
+即使為空也會顯示 `(none)`。其餘 include 值主要影響 JSON 輸出。`Relations`
+區塊會顯示關聯的另一個 issue；方向性關聯會以目前 issue 的視角呈現，例如
+`blocks` / `blocked`。
+
+`attachments` 只會取得附件的中繼資料（檔名、大小、`content_url`），不會下載
+附件檔案；描述中的 Markdown 圖片（例如 `![](image.jpg)`）也不會下載或解析。
+若需要實際檔案，請自行使用 `content_url`。
 
 ## 各專案統計
 
@@ -424,6 +458,29 @@ python3 redmine_cli.py export --output-dir /tmp/redmine-export
 CSV 的 `description` 預設截斷至 32000 字元（`description_truncated` 會標示），以符合
 Excel 儲存格上限；完整內容保留在 `issues.json`。需要完整描述可加
 `--csv-description-limit 0`。
+
+## 測試
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
+
+`-B` 可避免產生 `__pycache__/`。測試使用標準庫 `unittest`，不需要額外套件，
+也不會連線到 Redmine，且不會建立 `output/`。
+
+若想先清掉先前的 Python 快取：
+
+```bash
+rm -rf __pycache__ tests/__pycache__
+```
+
+`output/` 只會由 `issues`、`stats`、`assignees`、`export` 等需要快取或匯出的指令
+建立；`issue` 指令不會建立它。`output/` 可能包含實際 issue 匯出資料，需要清除時
+請先確認內容：
+
+```bash
+rm -rf output
+```
 
 ## TLS 注意事項
 

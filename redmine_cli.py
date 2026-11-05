@@ -20,6 +20,31 @@ import requests
 PLACEHOLDER = "在這裡填你的金鑰"
 TRUE_VALUES = {"1", "true", "yes", "on"}
 COMMANDS = {"export", "projects", "issues", "issue", "stats", "assignees", "meta"}
+
+
+class IssueNotFound(SystemExit):
+    pass
+
+
+ISSUE_INCLUDE_CHOICES = (
+    "journals",
+    "attachments",
+    "relations",
+    "children",
+    "changesets",
+    "watchers",
+    "allowed_statuses",
+)
+RELATION_TYPE_INVERSE = {
+    "blocks": "blocked",
+    "blocked": "blocks",
+    "precedes": "follows",
+    "follows": "precedes",
+    "copied_to": "copied_from",
+    "copied_from": "copied_to",
+    "duplicates": "duplicated",
+    "duplicated": "duplicates",
+}
 EXPORT_ONLY_FLAGS = {
     "--dry-run",
     "--output-dir",
@@ -211,7 +236,7 @@ class RedmineClient:
                 raise SystemExit("錯誤: 403 權限不足，該帳號無法讀取此範圍的資料")
             if response.status_code == 404:
                 if not_found:
-                    raise SystemExit(not_found)
+                    raise IssueNotFound(not_found)
                 raise SystemExit("錯誤: 404 找不到 API，請確認網址與 REST API 是否啟用")
             if response.status_code == 429 or 500 <= response.status_code < 600:
                 last_error = f"HTTP {response.status_code}"
@@ -948,13 +973,24 @@ def issue_url(client, issue):
 
 
 def issue_record(client, issue):
+    project = issue.get("project") or {}
+    tracker = issue.get("tracker") or {}
+    status = issue.get("status") or {}
     return {
         "id": issue.get("id"),
         "project": value_name(issue.get("project")),
+        "project_id": project.get("id"),
         "tracker": value_name(issue.get("tracker")),
+        "tracker_id": tracker.get("id"),
         "status": value_name(issue.get("status")),
+        "status_id": status.get("id"),
+        "priority": value_name(issue.get("priority")),
         "subject": issue.get("subject", ""),
+        "author": value_name(issue.get("author")),
         "assigned_to": value_name(issue.get("assigned_to")),
+        "done_ratio": issue.get("done_ratio") or 0,
+        "created_on": issue.get("created_on", ""),
+        "updated_on": issue.get("updated_on", ""),
         "url": issue_url(client, issue),
     }
 
@@ -1208,23 +1244,47 @@ def command_issues(args, client, output_dir, page_size):
     )
 
 
-def command_issue(args, client):
-    params = None if args.no_comments else {"include": "journals"}
-    data = client.get_json(
-        f"/issues/{args.issue_id}.json",
-        params,
-        not_found=f"錯誤: 找不到 issue #{args.issue_id}",
-    )
-    issue = data.get("issue") or {}
-    if args.format == "json":
-        payload = dict(issue)
-        payload["url"] = issue_url(client, issue)
-        emit_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            args.output,
+def parse_issue_include(raw):
+    items = [item.strip() for item in str(raw or "").split(",") if item.strip()]
+    invalid = [item for item in items if item not in ISSUE_INCLUDE_CHOICES]
+    if invalid:
+        raise ValueError(
+            "不支援的 --include 值: "
+            + ", ".join(invalid)
+            + "；可用: "
+            + ", ".join(ISSUE_INCLUDE_CHOICES)
         )
-        return
+    return list(dict.fromkeys(items))
 
+
+def issue_include_arg(raw):
+    try:
+        return parse_issue_include(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def resolve_issue_include(items, no_comments):
+    if isinstance(items, str):
+        items = parse_issue_include(items)
+    items = list(items or [])
+    if no_comments:
+        items = [item for item in items if item != "journals"]
+    return items
+
+
+def relation_display(relation, current_id):
+    from_id = relation.get("issue_id")
+    to_id = relation.get("issue_to_id")
+    relation_type = relation.get("relation_type") or "relates"
+    if current_id == from_id:
+        return to_id, relation_type
+    if current_id == to_id:
+        return from_id, RELATION_TYPE_INVERSE.get(relation_type, relation_type)
+    return to_id or from_id, relation_type
+
+
+def render_issue_text(client, issue, include_items):
     lines = [
         f"ID: {issue.get('id')}",
         f"URL: {issue_url(client, issue)}",
@@ -1234,7 +1294,7 @@ def command_issue(args, client):
         f"Priority: {value_name(issue.get('priority'))}",
         f"Assignee: {value_name(issue.get('assigned_to')) or '-'}",
         f"Author: {value_name(issue.get('author')) or '-'}",
-        f"Progress: {issue.get('done_ratio', 0)}%",
+        f"Progress: {issue.get('done_ratio') or 0}%",
         f"Created: {issue.get('created_on', '')}",
         f"Updated: {issue.get('updated_on', '')}",
     ]
@@ -1256,7 +1316,7 @@ def command_issue(args, client):
         ]
     )
 
-    if not args.no_comments:
+    if "journals" in include_items:
         journals = issue.get("journals") or []
         comments = [
             journal
@@ -1280,7 +1340,80 @@ def command_issue(args, client):
         if lines and lines[-1] == "":
             lines.pop()
 
-    emit_text("\n".join(lines) + "\n", args.output)
+    if "attachments" in include_items:
+        attachments = issue.get("attachments") or []
+        lines.extend(["", f"Attachments ({len(attachments)}):"])
+        if not attachments:
+            lines.append("  (none)")
+        for attachment in attachments:
+            size = attachment.get("filesize")
+            size_text = f" ({size} bytes)" if size not in (None, "") else ""
+            lines.append(f"  {attachment.get('filename') or '(unnamed)'}{size_text}")
+            if attachment.get("description"):
+                lines.append(f"    {attachment['description']}")
+            if attachment.get("content_url"):
+                lines.append(f"    {attachment['content_url']}")
+
+    if "relations" in include_items:
+        relations = issue.get("relations") or []
+        lines.extend(["", f"Relations ({len(relations)}):"])
+        if not relations:
+            lines.append("  (none)")
+        for relation in relations:
+            other_id, relation_type = relation_display(relation, issue.get("id"))
+            lines.append(f"  #{other_id} ({relation_type})")
+
+    return "\n".join(lines)
+
+
+def command_issue(args, client):
+    include_items = resolve_issue_include(args.include, args.no_comments)
+    params = {"include": ",".join(include_items)} if include_items else None
+    issue_ids = list(dict.fromkeys(args.issue_ids))
+    show_progress = len(issue_ids) > 1
+    issues = []
+    missing = []
+    try:
+        for index, issue_id in enumerate(issue_ids, 1):
+            if show_progress:
+                print(
+                    f"\r取得 issue {index}/{len(issue_ids)}...",
+                    end="",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            try:
+                data = client.get_json(
+                    f"/issues/{issue_id}.json",
+                    params,
+                    not_found=f"錯誤: 找不到 issue #{issue_id}",
+                )
+            except IssueNotFound as exc:
+                missing.append(str(exc))
+                continue
+            issues.append(data.get("issue") or {})
+    finally:
+        if show_progress:
+            print(file=sys.stderr)
+
+    for message in missing:
+        print(message, file=sys.stderr)
+    if not issues:
+        raise SystemExit(1)
+
+    if args.format == "json":
+        payloads = [dict(issue, url=issue_url(client, issue)) for issue in issues]
+        payload = payloads[0] if len(payloads) == 1 else payloads
+        emit_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            args.output,
+        )
+    else:
+        rendered = [render_issue_text(client, issue, include_items) for issue in issues]
+        emit_text("\n\n".join(rendered) + "\n", args.output)
+
+    if missing:
+        raise SystemExit(1)
 
 
 def issue_resolved_by(issue, user_id, resolved_ids):
@@ -1721,7 +1854,8 @@ def build_parser():
             "  |-- --hide-empty                     隱藏數量為 0\n"
             "  `-- 其他選項見 projects --help\n"
             "\n"
-            "  issue <ID>                           單一 issue 內容、進度、留言\n"
+            "  issue <ID> [<ID> ...]               一或多個 issue 內容、進度、留言\n"
+            "  |-- --include <LIST>                 預設 journals；可加 attachments,relations\n"
             "  |-- --no-comments\n"
             "  |-- --format <text|json>\n"
             "  `-- 其他選項見 issue --help\n"
@@ -1746,6 +1880,7 @@ def build_parser():
             "  %(prog)s                                   我的未關閉 issue\n"
             "  %(prog)s issues --assignee \"USER_NAME\"      看別人的 issue\n"
             "  %(prog)s issue 12345                       單一 issue 內容、進度、留言\n"
+            "  %(prog)s issue 12345 67890 --format json   多筆 issue JSON\n"
             "  %(prog)s projects --summary                上層專案摘要\n"
             "  %(prog)s stats --by-resolution             我曾經解決的數量\n"
             "  %(prog)s assignees --live                  重建 assignee 名單\n"
@@ -1945,26 +2080,48 @@ def build_parser():
     issue_parser = subparsers.add_parser(
         "issue",
         prog=f"{parser.prog} issue",
-        usage="%(prog)s <ID> [--no-comments] [--format text|json]",
-        help="顯示單一 issue 的內容、進度與留言",
+        usage=(
+            "%(prog)s <ID> [<ID> ...] [--no-comments] [--include LIST]\n"
+            "       [--format text|json]"
+        ),
+        help="顯示一或多個 issue 的內容、進度與留言",
         description=(
-            "顯示單一 issue 的欄位、進度、指派者與留言。\n"
-            "不加任何選項時：包含 journals（留言）。"
+            "顯示一或多個 issue 的欄位、進度、指派者與留言。\n"
+            "不加任何選項時：包含 journals（留言）。\n"
+            "多個 ID 時 JSON 輸出為陣列；單一 ID 維持物件。"
         ),
         epilog=(
             "範例:\n"
             "  %(prog)s 12345\n"
+            "  %(prog)s 12345 67890\n"
             "  %(prog)s 12345 --no-comments\n"
+            "  %(prog)s 12345 --include journals,attachments,relations\n"
             "  %(prog)s 12345 --format json"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    issue_parser.add_argument("issue_id", type=int, metavar="ID", help="必要參數：Issue ID")
+    issue_parser.add_argument(
+        "issue_ids",
+        type=int,
+        nargs="+",
+        metavar="ID",
+        help="必要參數：一或多個 Issue ID",
+    )
     issue_show = issue_parser.add_argument_group("顯示方式")
     issue_show.add_argument(
         "--no-comments",
         action="store_true",
-        help="預設顯示留言；不想看留言才加",
+        help="預設顯示留言；不想看留言才加（從 include 移除 journals）",
+    )
+    issue_show.add_argument(
+        "--include",
+        type=issue_include_arg,
+        default=["journals"],
+        metavar="LIST",
+        help=(
+            "預設 journals；逗號分隔，可用: "
+            + ",".join(ISSUE_INCLUDE_CHOICES)
+        ),
     )
     issue_show_output = issue_parser.add_argument_group("輸出")
     issue_show_output.add_argument(
