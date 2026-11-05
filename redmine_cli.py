@@ -5,6 +5,7 @@ import getpass
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -322,13 +323,13 @@ def fetch_issues(client, project, page_size):
     )
 
 
-def dry_run(client, project):
+def dry_run(client, project, project_label=None):
     params = {"status_id": "*", "limit": 1, "offset": 0, "sort": "id:asc"}
     if project:
         params["project_id"] = project
     data = client.get_json("/issues.json", params)
     total = data.get("total_count", len(data.get("issues") or []))
-    scope = f"專案 {project}" if project else "全部專案"
+    scope = f"專案 {project_label or project}" if project else "全部專案"
     print(f"{scope} 共 {total} 筆 issue（所有狀態）")
 
 
@@ -755,10 +756,18 @@ def get_current_user(client):
     return client.get_json("/users/current.json").get("user") or {}
 
 
+def normalize_account_name(value):
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+    text = re.sub(r"[\s\-.]+", "_", text)
+    text = re.sub(r"[^\w]+", "_", text, flags=re.UNICODE)
+    return text.strip("_")
+
+
 def collect_people(issues, closed_status_ids):
     totals = Counter()
     open_counts = Counter()
     names = {}
+    logins = {}
     for issue in issues:
         assignee = issue.get("assigned_to")
         if not assignee:
@@ -767,6 +776,9 @@ def collect_people(issues, closed_status_ids):
         if user_id is None:
             continue
         names[user_id] = str(assignee.get("name", "")).strip() or f"User {user_id}"
+        login = str(assignee.get("login") or "").strip()
+        if login:
+            logins[user_id] = login
         totals[user_id] += 1
         status = issue.get("status") or {}
         if status.get("id") not in closed_status_ids:
@@ -775,11 +787,42 @@ def collect_people(issues, closed_status_ids):
         {
             "id": user_id,
             "name": names[user_id],
+            "login": logins.get(user_id, ""),
+            "account": normalize_account_name(names[user_id]),
             "total": totals[user_id],
             "open": open_counts[user_id],
         }
         for user_id in totals
     ]
+
+
+def fetch_project_people(client, project, page_size=100):
+    memberships = fetch_all(
+        client,
+        f"/projects/{project}/memberships.json",
+        "memberships",
+        page_size=page_size,
+    )
+    people = []
+    for membership in memberships:
+        user = membership.get("user")
+        if not user:
+            continue
+        user_id = user.get("id")
+        name = str(user.get("name", "")).strip()
+        if user_id is None or not name:
+            continue
+        people.append(
+            {
+                "id": user_id,
+                "name": name,
+                "login": str(user.get("login") or "").strip(),
+                "account": normalize_account_name(name),
+                "total": 0,
+                "open": 0,
+            }
+        )
+    return people
 
 
 def load_export_issues(output_dir):
@@ -822,10 +865,14 @@ def load_assignee_cache(output_dir, base_url):
             continue
         total = person.get("total", 0)
         open_count = person.get("open", 0)
+        login = str(person.get("login") or "").strip()
+        account = str(person.get("account") or "").strip() or normalize_account_name(name)
         result.append(
             {
                 "id": user_id,
                 "name": name,
+                "login": login,
+                "account": account,
                 "total": total if isinstance(total, int) else 0,
                 "open": open_count if isinstance(open_count, int) else 0,
             }
@@ -845,9 +892,13 @@ def write_assignee_cache(output_dir, base_url, people):
             continue
         total = person.get("total", 0)
         open_count = person.get("open", 0)
+        login = str(person.get("login") or "").strip()
+        account = str(person.get("account") or "").strip() or normalize_account_name(name)
         unique[str(user_id)] = {
             "id": user_id,
             "name": name,
+            "login": login,
+            "account": account,
             "total": total if isinstance(total, int) else 0,
             "open": open_count if isinstance(open_count, int) else 0,
         }
@@ -867,65 +918,170 @@ def write_assignee_cache(output_dir, base_url, people):
         print(f"警告: 無法寫入 assignee 快取 {path}: {exc}", file=sys.stderr)
 
 
+def assignee_account(person):
+    return (
+        str(person.get("login") or "").strip()
+        or str(person.get("account") or "").strip()
+        or normalize_account_name(person.get("name"))
+    )
+
+
+def account_aliases(value):
+    value = str(value or "").strip().casefold()
+    if not value:
+        return set()
+    return {
+        value,
+        value.replace("_", ""),
+        value.replace("_", "."),
+        value.replace("_", "-"),
+    }
+
+
+def assignee_aliases(person):
+    aliases = set()
+    name = str(person.get("name", "")).strip()
+    if name:
+        aliases.add(name.casefold())
+    for key in ("login", "account"):
+        value = person.get(key)
+        aliases.update(account_aliases(value))
+        aliases.update(account_aliases(normalize_account_name(value)))
+    aliases.update(account_aliases(normalize_account_name(name)))
+    return aliases
+
+
+def assignee_search_values(person):
+    values = [str(person.get("name", "")).strip()]
+    values.extend(str(person.get(key) or "").strip() for key in ("login", "account"))
+    values.append(normalize_account_name(person.get("name")))
+    return [value.casefold() for value in values if value]
+
+
+def assignee_label(person):
+    account = assignee_account(person)
+    if account:
+        return f"{person['name']}({account}, {person['id']})"
+    return f"{person['name']}({person['id']})"
+
+
 def assignee_candidates(people, limit=15):
     return ", ".join(
-        f"{person['name']}({person['id']})"
+        assignee_label(person)
         for person in sorted(people, key=lambda item: item["name"].casefold())[:limit]
     )
 
 
 def match_assignee(people, value):
-    exact = [
+    target = value.strip().casefold()
+    exact = [person for person in people if target in assignee_aliases(person)]
+    matches = exact or [
         person
         for person in people
-        if person["name"].strip().casefold() == value.casefold()
-    ]
-    matches = exact or [
-        person for person in people if value.casefold() in person["name"].casefold()
+        if any(target in alias for alias in assignee_search_values(person))
     ]
     if len(matches) == 1:
         return str(matches[0]["id"])
     if len(matches) > 1:
-        names = ", ".join(
-            f"{person['name']}({person['id']})" for person in matches
-        )
+        names = ", ".join(assignee_label(person) for person in matches)
         raise SystemExit(f"錯誤: assignee '{value}' 不明確，候選: {names}")
     return None
 
 
-def resolve_assignee(raw, client, output_dir):
+def current_user_assignee_id(client, value):
+    try:
+        user = get_current_user(client)
+    except SystemExit:
+        return None
+    user_id = user.get("id")
+    if user_id is None:
+        return None
+    name = " ".join(
+        part
+        for part in (
+            str(user.get("firstname") or "").strip(),
+            str(user.get("lastname") or "").strip(),
+        )
+        if part
+    )
+    login = user.get("login")
+    aliases = account_aliases(login)
+    aliases.update(account_aliases(normalize_account_name(login)))
+    if name:
+        aliases.add(name.casefold())
+        aliases.update(account_aliases(normalize_account_name(name)))
+    if value.casefold() in aliases:
+        return str(user_id)
+    return None
+
+
+def lookup_user_id_by_login(client, login):
+    try:
+        data = client.get_json("/users.json", {"name": login, "status": "active"})
+    except SystemExit as exc:
+        message = str(exc)
+        if "403" in message or "404" in message:
+            return None
+        raise
+    users = data.get("users") or []
+    exact = [
+        user
+        for user in users
+        if str(user.get("login") or "").casefold() == login.casefold()
+    ]
+    if len(exact) == 1:
+        return str(exact[0]["id"])
+    return None
+
+
+def resolve_assignee(raw, client, output_dir, project=None):
     value = (raw or "me").strip()
     if value.lower() == "me" or value.isdigit():
         return value
 
+    people = None
     cached = load_assignee_cache(output_dir, client.base_url)
     if cached:
         matched = match_assignee(cached, value)
         if matched:
             return matched
+        people = cached
 
     issues = load_export_issues(output_dir)
     if issues is not None:
-        people = collect_people(issues, set())
-        write_assignee_cache(output_dir, client.base_url, people)
-        matched = match_assignee(people, value)
+        exported_people = collect_people(issues, set())
+        write_assignee_cache(output_dir, client.base_url, exported_people)
+        matched = match_assignee(exported_people, value)
         if matched:
             return matched
-        raise SystemExit(
-            f"錯誤: 找不到 assignee '{raw}'。可用名單: "
-            f"{assignee_candidates(people)}\n"
-            "提示: 執行 assignees --live 可重新整理名單。"
-        )
+        people = exported_people
 
-    if cached:
+    matched = current_user_assignee_id(client, value)
+    if matched:
+        return matched
+
+    if project:
+        project_people = fetch_project_people(client, project)
+        matched = match_assignee(project_people, value)
+        if matched:
+            return matched
+        if project_people:
+            people = project_people
+
+    matched = lookup_user_id_by_login(client, value)
+    if matched:
+        return matched
+
+    if people:
         raise SystemExit(
-            f"錯誤: 快取名單中找不到 assignee '{raw}'。候選: "
-            f"{assignee_candidates(cached)}\n"
-            "提示: 執行 assignees --live 可重新整理名單。"
+            f"錯誤: 找不到 assignee '{value}'。候選: "
+            f"{assignee_candidates(people)}\n"
+            "提示: 帳號可用顯示名稱或小寫底線形式（例如 Jane Doe -> jane_doe）；"
+            "名單可用 assignees --live 重新整理。"
         )
 
     raise SystemExit(
-        f"錯誤: 找不到 assignee 名單，無法解析 '{raw}'。\n"
+        f"錯誤: 找不到 assignee 名單，無法解析 '{value}'。\n"
         "請改用數字 ID，或先執行下列其中一個指令：\n"
         "  ./redmine_cli.py assignees --live\n"
         "  ./redmine_cli.py export"
@@ -1158,10 +1314,10 @@ def command_issues(args, client, output_dir, page_size):
     tracker_values = (
         resolve_ids(trackers, args.tracker, "Tracker") if args.tracker else [None]
     )
-    assignee = resolve_assignee(args.assignee, client, output_dir)
     project = None
     if args.project:
         project = resolve_project(args.project, get_projects(client))
+    assignee = resolve_assignee(args.assignee, client, output_dir, project)
 
     limit = max(0, args.limit)
     merged = {}
@@ -1433,7 +1589,12 @@ def issue_resolved_by(issue, user_id, resolved_ids):
 def command_stats_by_resolution(
     args, client, output_dir, page_size, resolved_ids
 ):
-    assignee = resolve_assignee(args.assignee, client, output_dir)
+    project_filter = None
+    if args.project:
+        project_filter = resolve_project(args.project, get_projects(client))
+    assignee = resolve_assignee(
+        args.assignee, client, output_dir, project_filter
+    )
     if assignee == "me":
         user_id = get_current_user(client).get("id")
     else:
@@ -1446,8 +1607,8 @@ def command_stats_by_resolution(
         "status_id": "*",
         "sort": "id:asc",
     }
-    if args.project:
-        params["project_id"] = resolve_project(args.project, get_projects(client))
+    if project_filter:
+        params["project_id"] = project_filter
     issues = fetch_all(
         client,
         "/issues.json",
@@ -1536,14 +1697,19 @@ def command_stats(args, client, output_dir, page_size):
     closed_ids = {
         str(status.get("id")) for status in statuses if status.get("is_closed")
     }
-    assignee = resolve_assignee(args.assignee, client, output_dir)
+    project_filter = None
+    if args.project:
+        project_filter = resolve_project(args.project, get_projects(client))
+    assignee = resolve_assignee(
+        args.assignee, client, output_dir, project_filter
+    )
     params = {
         "assigned_to_id": assignee,
         "status_id": "*",
         "sort": "id:asc",
     }
-    if args.project:
-        params["project_id"] = resolve_project(args.project, get_projects(client))
+    if project_filter:
+        params["project_id"] = project_filter
     issues = fetch_all(
         client,
         "/issues.json",
@@ -1690,25 +1856,37 @@ def command_assignees(args, client, output_dir, page_size):
         )
         return
     if args.format == "csv":
-        headers = ["id", "name", "total", "open"]
+        headers = ["id", "name", "account", "total", "open"]
         rows = [
-            [person["id"], person["name"], person["total"], person["open"]]
+            [
+                person["id"],
+                person["name"],
+                assignee_account(person),
+                person["total"],
+                person["open"],
+            ]
             for person in people
         ]
         emit_text(csv_text(headers, rows), args.output, bom=True)
         return
-    headers = ["ID", "Name", "Total", "Open"]
+    headers = ["ID", "Name", "Account", "Total", "Open"]
     rows = [
-        [person["id"], person["name"], person["total"], person["open"]]
+        [
+            person["id"],
+            person["name"],
+            assignee_account(person),
+            person["total"],
+            person["open"],
+        ]
         for person in people
     ]
     emit_text(
         render_table(
             headers,
             rows,
-            max_widths=[8, 36, 7, 7],
-            min_widths=[3, 12, 3, 3],
-            alignments=["right", "left", "right", "right"],
+            max_widths=[8, 30, 24, 7, 7],
+            min_widths=[3, 12, 8, 3, 3],
+            alignments=["right", "left", "left", "right", "right"],
         ),
         args.output,
     )
@@ -1775,12 +1953,15 @@ def command_meta(args, client):
 
 
 def command_export(args, client, script_dir):
+    project = None
+    if args.project:
+        project = resolve_project(args.project, get_projects(client))
     if args.dry_run:
-        dry_run(client, args.project)
+        dry_run(client, project, args.project)
         return
 
     page_size = max(1, min(args.page_size, 100))
-    issues = fetch_issues(client, args.project, page_size)
+    issues = fetch_issues(client, project, page_size)
     output_dir = (
         Path(args.output_dir).expanduser()
         if args.output_dir
@@ -1843,7 +2024,7 @@ def build_parser():
             "                                       = issues --assignee me --status open\n"
             "\n"
             "  issues\n"
-            "  |-- --assignee <me|ID|姓名>          看別人的 issue\n"
+            "  |-- --assignee <me|ID|帳號|姓名>    看別人的 issue\n"
             "  |-- --status <open|closed|all|名稱>  狀態\n"
             "  |-- --project <ID|名稱>              只看某專案\n"
             "  `-- 其他選項見 issues --help\n"
@@ -1861,7 +2042,7 @@ def build_parser():
             "  `-- 其他選項見 issue --help\n"
             "\n"
             "  stats\n"
-            "  |-- --assignee <me|ID|姓名>          統計對象\n"
+            "  |-- --assignee <me|ID|帳號|姓名>    統計對象\n"
             "  |-- --by-resolution                  依 journal 計算曾解決\n"
             "  |-- --resolved-status <名稱|ID>\n"
             "  `-- 其他選項見 stats --help\n"
@@ -1920,7 +2101,7 @@ def build_parser():
     export_group = export_parser.add_argument_group("匯出選項")
     export_group.add_argument(
         "--project",
-        help="預設全部專案；只匯出某專案才加",
+        help="預設全部專案；只匯出某專案才加（名稱/identifier/ID）",
     )
     export_group.add_argument(
         "--output-dir",
@@ -2015,7 +2196,7 @@ def build_parser():
         "issues",
         prog=f"{parser.prog} issues",
         usage=(
-            "%(prog)s [--assignee <me|ID|NAME>]\n"
+            "%(prog)s [--assignee <me|ID|ACCOUNT|NAME>]\n"
             "       [--status <open|closed|all|NAME>] [--project <NAME|ID>]\n"
             "       [--format table|json|csv]"
         ),
@@ -2040,7 +2221,7 @@ def build_parser():
     issue_query.add_argument(
         "--assignee",
         default="me",
-        help="預設 me；Assignee=指派對象（API assigned_to）；姓名需本機名單",
+        help="預設 me；可用數字 ID、登入帳號或顯示名稱；帳號/姓名需本機名單",
     )
     issue_query.add_argument(
         "--status",
@@ -2137,7 +2318,7 @@ def build_parser():
         "stats",
         prog=f"{parser.prog} stats",
         usage=(
-            "%(prog)s [--assignee <me|ID|NAME>] [--by-resolution]\n"
+            "%(prog)s [--assignee <me|ID|ACCOUNT|NAME>] [--by-resolution]\n"
             "       [--project <NAME|ID>] [--resolved-status <NAME|ID>]\n"
             "       [--format table|json|csv]"
         ),
@@ -2162,7 +2343,7 @@ def build_parser():
     stats_query.add_argument(
         "--assignee",
         default="me",
-        help="預設 me；Assignee=指派對象（API assigned_to）；姓名需本機名單",
+        help="預設 me；可用數字 ID、登入帳號或顯示名稱；帳號/姓名需本機名單",
     )
     stats_query.add_argument(
         "--project",
@@ -2194,7 +2375,7 @@ def build_parser():
         usage="%(prog)s [--sort total|open|name] [--live] [--format table|json|csv]",
         help="列出 issue 的 assignee",
         description=(
-            "列出 issue 中出現過的 assignee，並更新 output/assignees.json 快取。\n"
+            "列出 issue 中出現過的 assignee（含帳號別名），並更新 output/assignees.json 快取。\n"
             "不加任何選項時：依序讀取 output/issues.json 或 output/assignees.json。"
         ),
         epilog=(

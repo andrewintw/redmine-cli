@@ -112,7 +112,7 @@ usage: redmine_cli.py [<指令>] [選項]
                                        = issues --assignee me --status open
 
   issues
-  |-- --assignee <me|ID|姓名>          看別人的 issue
+  |-- --assignee <me|ID|帳號|姓名>    看別人的 issue
   |-- --status <open|closed|all|名稱>  狀態
   |-- --project <ID|名稱>              只看某專案
   `-- 其他選項見 issues --help
@@ -130,7 +130,7 @@ usage: redmine_cli.py [<指令>] [選項]
   `-- 其他選項見 issue --help
 
   stats
-  |-- --assignee <me|ID|姓名>          統計對象
+  |-- --assignee <me|ID|帳號|姓名>    統計對象
   |-- --by-resolution                  依 journal 計算曾解決
   |-- --resolved-status <名稱|ID>
   `-- 其他選項見 stats --help
@@ -149,7 +149,7 @@ usage: redmine_cli.py [<指令>] [選項]
 
 ```bash
 python3 redmine_cli.py                                   我的未關閉 issue
-python3 redmine_cli.py issues --assignee "USER_NAME"      看別人的 issue
+python3 redmine_cli.py issues --assignee alice_smith      看別人的 issue
 python3 redmine_cli.py issue 12345                       單一 issue 內容、進度、留言
 python3 redmine_cli.py issue 12345 67890 --format json   多筆 issue JSON
 python3 redmine_cli.py projects --summary                上層專案摘要
@@ -246,15 +246,19 @@ ID   Project    Tracker  Status  Subject                URL
 
 ```bash
 python3 redmine_cli.py issues --assignee 123
-python3 redmine_cli.py issues --assignee "USER_NAME"
+python3 redmine_cli.py issues --assignee jane_doe
+python3 redmine_cli.py issues --assignee "Jane Doe"
 ```
 
 `assignee` 是 Redmine 的 Assignee，也就是 `assigned_to` / 指派對象。
 
-`--assignee` 接受 `me`、數字 ID、姓名。姓名解析優先使用
-`output/assignees.json` 小快取，其次才是 `output/issues.json`；兩者都不存在時
-不會自動下載全部 issue，而是提示先執行 `assignees --live` 或 `export`，
-或直接改用數字 ID。
+`--assignee` 接受 `me`、數字 ID、登入帳號或顯示名稱。帳號比對支援
+`jane_doe`、`alice_smith` 這種小寫底線形式；若 API 未提供其他使用者的
+login（非 admin 常見），會以顯示名稱推導（小寫、空白轉底線）。
+解析優先使用 `output/assignees.json` 小快取，其次才是 `output/issues.json`；
+若同時指定 `--project`，會用該專案的直接成員名單解析，不需要先建立快取。
+兩者都不存在時不會自動下載全部 issue，而是提示先執行 `assignees --live`
+或 `export`，或直接改用數字 ID。
 
 篩選與輸出：
 
@@ -400,9 +404,10 @@ python3 redmine_cli.py assignees --live
 小快取，不會自動下載全部 issue。`--live` 會忽略快取，直接從 API 重新建立名單
 （會下載全部 issue）並更新快取。
 
-`output/assignees.json` 只存姓名、ID 與 `Total / Open` 統計，供
-`--assignee "姓名"` 解析及 `assignees` 顯示使用，不會儲存 issue 內容。
-名單有變動時再執行一次 `assignees --live` 即可。
+`output/assignees.json` 只存姓名、ID、帳號別名與 `Total / Open` 統計，供
+`--assignee "帳號/姓名"` 解析及 `assignees` 顯示使用，不會儲存 issue 內容。
+輸出包含 `ID`、`Name`、`Account`、`Total`、`Open`；`Account` 可直接用在
+`--assignee`。名單有變動時再執行一次 `assignees --live` 即可。
 
 ## 列出 Tracker / Status
 
@@ -424,18 +429,21 @@ python3 redmine_cli.py export --project my-project
 python3 redmine_cli.py export --output-dir /tmp/redmine-export
 ```
 
+`--project` 可用專案名稱、identifier 或數字 ID，例如 `"Project A"`、
+`project-a` 或 `101`。
+
 預設輸出到 `output/`：
 
 - `output/issues.json`：Redmine API 回傳的完整原始資料
 - `output/issues.csv`：整理後欄位，UTF-8 BOM 編碼，可直接用 Excel 開啟
-- `output/assignees.json`：姓名、ID 與統計數量的小快取，供姓名解析使用
+- `output/assignees.json`：姓名、ID、帳號別名與統計數量的小快取，供帳號/姓名解析使用
 
 ## 匯出參數
 
 | 參數 | 說明 |
 | --- | --- |
 | `--url` | Redmine 網址，預設讀取 `REDMINE_URL` |
-| `--project` | 只匯出指定專案 identifier 或 id |
+| `--project` | 只匯出指定專案名稱、identifier 或 id |
 | `--output-dir` | 輸出目錄，預設為程式所在目錄的 `output` |
 | `--format` | `json`、`csv`、`both`（預設） |
 | `--api-key-file` | 從檔案讀取 API 金鑰 |
@@ -515,8 +523,9 @@ export REQUESTS_CA_BUNDLE=/path/to/ca.pem
 - **403 權限不足**：該帳號角色無權讀取部分專案；使用者清單 API 通常需要 admin。
 - **404 找不到 API**：網址錯誤，或 Redmine REST API 未啟用。
 - **只抓到部分 issue**：確認帳號權限；工具會依 `total_count` 自動翻頁。
-- **找不到 assignee 姓名**：先執行 `assignees --live` 建立
-  `output/assignees.json`，或改用數字 ID。程式不會再自動下載全部 issue 來解析姓名。
+- **找不到 assignee 帳號/姓名**：先執行 `assignees --live` 建立
+  `output/assignees.json`，或改用數字 ID。帳號可用 `jane_doe` 這種小寫底線形式；
+  程式不會再自動下載全部 issue 來解析帳號或姓名。
 - **未設定 Redmine 網址**：建立 `.env`、設定 `REDMINE_URL`，或加上 `--url`。
 - **無法互動輸入 API 金鑰**：目前環境沒有終端機；請用 `.env`、`REDMINE_API_KEY`
   或 `--api-key-file`。
