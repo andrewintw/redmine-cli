@@ -472,14 +472,47 @@ Excel 儲存格上限；完整內容保留在 `issues.json`。需要完整描述
 
 ## 測試
 
+測試位於 `tests/test_redmine_cli.py`，使用標準庫 `unittest`，不需要額外套件、
+`.env` 或網路連線。測試使用假 Redmine client，資料皆為虛構。
+
+執行全部測試：
+
 ```bash
 python3 -B -m unittest discover -s tests -v
 ```
 
-`-B` 可避免產生 `__pycache__/`。測試使用標準庫 `unittest`，不需要額外套件，
-也不會連線到 Redmine，且不會建立 `output/`。
+`-B` 可避免產生 `__pycache__/`。
 
-若想先清掉先前的 Python 快取：
+只跑單一測試檔：
+
+```bash
+python3 -B tests/test_redmine_cli.py -v
+```
+
+只跑單一測試類別：
+
+```bash
+python3 -B tests/test_redmine_cli.py CommandIssuesMultiProjectTests -v
+```
+
+只跑單一測試方法：
+
+```bash
+python3 -B tests/test_redmine_cli.py \
+  CommandIssuesMultiProjectTests.test_multiple_projects_merges_all -v
+```
+
+測試涵蓋：
+
+- `--include` 解析、issue text/JSON 輸出、relations 方向
+- 多 issue 查詢、單筆/多筆 JSON 形狀、部分 404
+- 多專案逗號查詢、去重、`--limit`、status/tracker 篩選
+- assignee 帳號 alias、快取、export 檔、專案成員名單
+- `stats` / `stats --by-resolution` 多專案統計
+- `export` 多專案、JSON/CSV/both、dry-run
+- parser 預設值與多專案參數
+
+測試不會建立 `output/`。若想先清掉先前的 Python 快取：
 
 ```bash
 rm -rf __pycache__ tests/__pycache__
